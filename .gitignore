@@ -1,0 +1,43 @@
+# Virtual environments
+.venv/
+venv/
+env/
+backend/venv/
+backend/venv-win/
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+frontend/src-tauri/target/
+
+# Environment files & secrets
+.env
+.env.*
+!.env.example
+
+# SQLite Databases & runtime logs
+*.db
+*.sqlite
+*.sqlite3
+linuxpilot.db
+logs/
+*.log
+.pids/
+*.pid
+
+# IDE & OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

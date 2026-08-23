@@ -1,0 +1,58 @@
+version: "3.9"
+
+# LinuxPilot AI stack: local Ollama runtime (Qwen 2.5 Instruct) + FastAPI
+# backend + a shared workspace volume for anything the agent reads/writes
+# (e.g. exported diagnostic reports). The frontend (Tauri desktop app) is
+# built and run natively on the host, not containerized, since it needs
+# direct access to global-shortcut/window APIs.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: linuxpilot-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: linuxpilot-backend
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: qwen2.5:7b-instruct
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      ALLOW_COMMAND_EXECUTION: "false"
+      ALLOWED_SERVICES: docker,apache2,nginx,ssh,mysql,postgresql
+      COMMAND_TIMEOUT_SECONDS: "20"
+    volumes:
+      - workspace:/workspace
+      - linuxpilot_db:/app/data
+      # NOTE: mounting the host's D-Bus/systemd socket is required for
+      # SERVICE_MANAGEMENT/LOG_ANALYSIS to see the *host's* services
+      # rather than the container's own. Uncomment on a systemd host:
+      # - /run/systemd:/run/systemd:ro
+      # - /var/run/dbus:/var/run/dbus:ro
+    # Diagnostics/service checks generally need real host visibility;
+    # running unprivileged inside a container is the safe default and
+    # is intentional here even though it limits what can be inspected.
+
+volumes:
+  ollama_data:
+  workspace:
+  linuxpilot_db:

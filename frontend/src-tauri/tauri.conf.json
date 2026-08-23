@@ -1,0 +1,39 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:1420",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "LinuxPilot AI",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "globalShortcut": { "all": true },
+      "shell": { "open": true }
+    },
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "ai.linuxpilot.app",
+      "icon": []
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "LinuxPilot AI",
+        "width": 720,
+        "height": 480,
+        "resizable": true,
+        "decorations": true,
+        "alwaysOnTop": true,
+        "center": true,
+        "visible": false
+      }
+    ]
+  }
+}
