@@ -1,5 +1,12 @@
 import os
 import sys
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from fastapi.testclient import TestClient
 from backend.main import app
 
