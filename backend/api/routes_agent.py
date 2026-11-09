@@ -21,9 +21,12 @@ logger = logging.getLogger("linuxpilot.api.agent")
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 
+from typing import Optional
+
 class AgentQueryRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Natural language user query")
     confirmed: bool = Field(False, description="Explicit confirmation flag for modifying commands")
+    operation_id: Optional[str] = Field(None, description="Action-bound cryptographic authorization ticket")
 
 
 class AgentQueryResponse(BaseModel):
@@ -54,7 +57,11 @@ async def ask_agent(payload: AgentQueryRequest) -> AgentQueryResponse:
         return AgentQueryResponse(success=False, error="Query must not be empty.")
 
     try:
-        result = await orchestrator.run(query_str, confirmed=payload.confirmed)
+        result = await orchestrator.run(
+            query_str,
+            confirmed=payload.confirmed,
+            operation_id=payload.operation_id,
+        )
         log_interaction(
             query=query_str,
             intent=result.intent,

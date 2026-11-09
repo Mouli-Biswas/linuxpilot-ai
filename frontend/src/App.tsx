@@ -4,6 +4,7 @@ import QueryBox from "./components/QueryBox";
 import PlanTrace from "./components/PlanTrace";
 import MetricsBar from "./components/MetricsBar";
 import {
+  approveAuthorization,
   askAgent,
   getHistory,
   getSystemMetrics,
@@ -55,7 +56,7 @@ export default function App() {
     setHistory(rows);
   }
 
-  async function handleQuery(query: string, confirmed: boolean = false) {
+  async function handleQuery(query: string, confirmed: boolean = false, operationId?: string) {
     if (confirmed) {
       setConfirming(true);
     } else {
@@ -64,7 +65,17 @@ export default function App() {
     setError(null);
     setCurrentQuery(query);
 
-    const res = await askAgent(query, confirmed);
+    // If an operationId is supplied for execution, perform the explicit approval transition first
+    if (confirmed && operationId) {
+      const approveRes = await approveAuthorization(operationId);
+      if (!approveRes.success) {
+        setConfirming(false);
+        setError(`Explicit approval failed: ${approveRes.reason}`);
+        return;
+      }
+    }
+
+    const res = await askAgent(query, confirmed, operationId);
     setLoading(false);
     setConfirming(false);
 
@@ -175,7 +186,7 @@ export default function App() {
         {result && (
           <PlanTrace
             result={result}
-            onConfirmCommand={(q) => handleQuery(q, true)}
+            onConfirmCommand={(q, opId) => handleQuery(q, true, opId)}
             confirming={confirming}
           />
         )}

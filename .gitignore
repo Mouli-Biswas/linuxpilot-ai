@@ -41,3 +41,6 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Project backup archives
+*.zip

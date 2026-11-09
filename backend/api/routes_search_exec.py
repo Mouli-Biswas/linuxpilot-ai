@@ -27,12 +27,19 @@ def search_files_endpoint(query: FileSearchQuery) -> FileSearchResult:
     return search_files(query)
 
 
+from typing import Optional
+
 class CommandExecutionRequest(BaseModel):
     command: str
     confirmed: bool = False
+    operation_id: Optional[str] = None
 
 
 @exec_router.post("/command", response_model=ExecutionResult)
 def execute_command_endpoint(payload: CommandExecutionRequest) -> ExecutionResult:
-    return execute_validated_command(payload.command, confirmed=payload.confirmed)
+    return execute_validated_command(
+        payload.command,
+        confirmed=payload.confirmed,
+        operation_id=payload.operation_id,
+    )
 

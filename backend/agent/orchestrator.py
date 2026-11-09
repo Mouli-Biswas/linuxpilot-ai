@@ -55,6 +55,8 @@ class AgentRunResult(BaseModel):
     final_answer: str
     total_duration_ms: int
     timings: Optional[AgentTimings] = None
+    requires_confirmation: bool = False
+    pending_authorization: Optional[dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -287,10 +289,16 @@ class AgentOrchestrator:
             state_badge = "⚪ **UNKNOWN**"
 
         if service_data.get("requires_confirmation"):
+            auth = service_data.get("authorization") or {}
+            op_id = auth.get("operation_id", "pending")
+            expires = auth.get("expires_at", "N/A")
+            ttl = auth.get("ttl_seconds", "N/A")
             return (
                 f"⚠️ **User Confirmation Required**\n\n"
                 f"**Service:** `{service_name}`\n\n"
                 f"**Action:** `{action.upper()}`\n\n"
+                f"**Authorization Ticket:** `{op_id}`\n\n"
+                f"**Expires:** `{expires}` ({ttl}s remaining)\n\n"
                 f"**Notice:** This action modifies running service state (`MODIFYING`). "
                 f"Please confirm if you want to {action} `{service_name}`."
             )
@@ -365,9 +373,15 @@ class AgentOrchestrator:
             )
 
         if requires_conf and not executed:
+            auth = cmd_data.get("authorization") or {}
+            op_id = auth.get("operation_id", "pending")
+            expires = auth.get("expires_at", "N/A")
+            ttl = auth.get("ttl_seconds", "N/A")
             return (
                 f"⚠️ **User Confirmation Required**\n\n"
                 f"**Command:** `{cmd}`\n\n"
+                f"**Authorization Ticket:** `{op_id}`\n\n"
+                f"**Expires:** `{expires}` ({ttl}s remaining)\n\n"
                 f"**Notice:** This command modifies system state (`{validation.get('category', 'MODIFYING')}`). "
                 f"Please confirm if you want to execute this command."
             )
@@ -398,7 +412,12 @@ class AgentOrchestrator:
                 return text
         return None
 
-    async def run(self, query: str, confirmed: bool = False) -> AgentRunResult:
+    async def run(
+        self,
+        query: str,
+        confirmed: bool = False,
+        operation_id: Optional[str] = None,
+    ) -> AgentRunResult:
         start = time.monotonic()
         timings = AgentTimings()
 
@@ -441,25 +460,28 @@ class AgentOrchestrator:
         t_start = time.monotonic()
         step_results: list[StepExecution] = []
         collected_context: list[dict[str, Any]] = []
+        requires_confirmation = False
+        pending_authorization = None
 
         for step in plan.steps:
             if step.tool in {"llm.summarize", "response.formatter"}:
                 continue
 
             step_start = time.monotonic()
-            args = self._merge_args(step, classification, confirmed=confirmed)
+            args = self._merge_args(
+                step,
+                classification,
+                confirmed=confirmed,
+                operation_id=operation_id,
+            )
 
-            if step.tool in {"service.restart", "service.start", "service.stop"} and not confirmed:
-                output = {
-                    "service": args.get("service_name", ""),
-                    "action": step.tool.split(".")[1],
-                    "success": False,
-                    "requires_confirmation": True,
-                    "error": f"Confirmation required to {step.tool.split('.')[1]} service '{args.get('service_name', '')}'",
-                }
-            else:
-                logger.info("Executing step %s: %s args=%s", step.step, step.tool, args)
-                output = run_tool(step.tool, args)
+            logger.info("Executing step %s: %s args=%s", step.step, step.tool, args)
+            output = run_tool(step.tool, args)
+
+            if output.get("requires_confirmation"):
+                requires_confirmation = True
+                if output.get("authorization"):
+                    pending_authorization = output.get("authorization")
 
             duration_ms = int((time.monotonic() - step_start) * 1000)
 
@@ -518,6 +540,8 @@ class AgentOrchestrator:
             final_answer=final_answer,
             total_duration_ms=timings.total_ms,
             timings=timings,
+            requires_confirmation=requires_confirmation,
+            pending_authorization=pending_authorization,
         )
 
     @staticmethod
@@ -525,6 +549,7 @@ class AgentOrchestrator:
         step: PlanStep,
         classification: ClassificationResult,
         confirmed: bool = False,
+        operation_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Merge planner arguments with parameters extracted by the intent classifier."""
         merged: dict[str, Any] = {}
@@ -533,6 +558,8 @@ class AgentOrchestrator:
         if step.tool.startswith("service."):
             if "service_name" in params:
                 merged["service_name"] = params["service_name"]
+            if operation_id:
+                merged["operation_id"] = operation_id
 
         elif step.tool == "file_search.search":
             merged["search_path"] = params.get("search_path", os.path.expanduser("~"))
@@ -553,6 +580,8 @@ class AgentOrchestrator:
             if "raw_command" in params:
                 merged["command"] = params["raw_command"]
             merged["confirmed"] = confirmed
+            if operation_id:
+                merged["operation_id"] = operation_id
 
         elif step.tool == "diagnostics.disk":
             if "search_path" in params:

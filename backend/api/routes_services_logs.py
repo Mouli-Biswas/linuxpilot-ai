@@ -34,6 +34,13 @@ services_router = APIRouter(prefix="/api/services", tags=["services"])
 logs_router = APIRouter(prefix="/api/logs", tags=["logs"])
 
 
+from typing import Optional
+from pydantic import BaseModel, Field
+
+class ServiceActionRequest(BaseModel):
+    operation_id: Optional[str] = Field(None, description="Action-bound authorization ticket")
+
+
 @services_router.get("/{service_name}/status", response_model=ServiceResult)
 def service_status(service_name: str) -> ServiceResult:
     try:
@@ -45,9 +52,10 @@ def service_status(service_name: str) -> ServiceResult:
 
 
 @services_router.post("/{service_name}/restart", response_model=ServiceResult)
-def service_restart(service_name: str) -> ServiceResult:
+def service_restart(service_name: str, payload: Optional[ServiceActionRequest] = None) -> ServiceResult:
+    operation_id = payload.operation_id if payload else None
     try:
-        return restart_service(service_name)
+        return restart_service(service_name, operation_id=operation_id)
     except ServiceManagerError as exc:
         return ServiceResult(
             service=service_name, unit="", action="restart", success=False, output="", error=str(exc)
@@ -55,17 +63,19 @@ def service_restart(service_name: str) -> ServiceResult:
 
 
 @services_router.post("/{service_name}/start", response_model=ServiceResult)
-def service_start(service_name: str) -> ServiceResult:
+def service_start(service_name: str, payload: Optional[ServiceActionRequest] = None) -> ServiceResult:
+    operation_id = payload.operation_id if payload else None
     try:
-        return start_service(service_name)
+        return start_service(service_name, operation_id=operation_id)
     except ServiceManagerError as exc:
         return ServiceResult(service=service_name, unit="", action="start", success=False, output="", error=str(exc))
 
 
 @services_router.post("/{service_name}/stop", response_model=ServiceResult)
-def service_stop(service_name: str) -> ServiceResult:
+def service_stop(service_name: str, payload: Optional[ServiceActionRequest] = None) -> ServiceResult:
+    operation_id = payload.operation_id if payload else None
     try:
-        return stop_service(service_name)
+        return stop_service(service_name, operation_id=operation_id)
     except ServiceManagerError as exc:
         return ServiceResult(service=service_name, unit="", action="stop", success=False, output="", error=str(exc))
 

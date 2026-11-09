@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS command_audit (
     executed INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS authorization_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_resource TEXT NOT NULL,
+    status TEXT NOT NULL,
+    details TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -81,6 +91,27 @@ def log_command_audit(command: str, verdict: str, reason: str, executed: bool) -
             )
     except sqlite3.Error as exc:
         logger.error("Failed to log command audit: %s", exc)
+
+
+def log_authorization_audit(
+    operation_id: str, action: str, target_resource: str, status: str, details: str = ""
+) -> None:
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO authorization_audit (operation_id, action, target_resource, status, details, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    operation_id,
+                    action,
+                    target_resource,
+                    status,
+                    details,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+    except sqlite3.Error as exc:
+        logger.error("Failed to log authorization audit: %s", exc)
 
 
 def get_recent_interactions(limit: int = 20) -> list[dict]:

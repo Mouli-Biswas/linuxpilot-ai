@@ -22,6 +22,18 @@ export interface AgentTimings {
   total_ms: number;
 }
 
+export interface AuthorizationPreview {
+  operation_id: string;
+  action: string;
+  target_resource: string;
+  parameters: Record<string, any>;
+  expected_postconditions: Record<string, any>;
+  action_summary: string;
+  status?: string;
+  expires_at: string;
+  ttl_seconds: number;
+}
+
 export interface AgentRunResult {
   query: string;
   intent: string;
@@ -31,6 +43,8 @@ export interface AgentRunResult {
   final_answer: string;
   total_duration_ms: number;
   timings?: AgentTimings;
+  requires_confirmation?: boolean;
+  pending_authorization?: AuthorizationPreview;
 }
 
 export interface AgentQueryResponse {
@@ -46,12 +60,20 @@ export interface SystemMetricsSnapshot {
   networkConnected?: boolean;
 }
 
-export async function askAgent(query: string, confirmed: boolean = false): Promise<AgentQueryResponse> {
+export async function askAgent(
+  query: string,
+  confirmed: boolean = false,
+  operationId?: string
+): Promise<AgentQueryResponse> {
   try {
     const res = await fetch(`${API_BASE}/api/agent/ask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, confirmed }),
+      body: JSON.stringify({
+        query,
+        confirmed,
+        operation_id: operationId,
+      }),
     });
     if (!res.ok) {
       return { success: false, error: `HTTP ${res.status}: ${res.statusText}` };
@@ -59,6 +81,52 @@ export async function askAgent(query: string, confirmed: boolean = false): Promi
     return (await res.json()) as AgentQueryResponse;
   } catch (err: any) {
     return { success: false, error: err.message || "Failed to connect to backend." };
+  }
+}
+
+export interface ApproveAuthorizationResponse {
+  success: boolean;
+  operation_id: string;
+  status: string;
+  reason: string;
+  authorization?: AuthorizationPreview;
+}
+
+export async function approveAuthorization(
+  operationId: string,
+  action?: string,
+  targetResource?: string,
+  parameters?: Record<string, any>,
+  expectedPostconditions?: Record<string, any>
+): Promise<ApproveAuthorizationResponse> {
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        operation_id: operationId,
+        action,
+        target_resource: targetResource,
+        parameters,
+        expected_postconditions: expectedPostconditions,
+      }),
+    });
+    if (!res.ok) {
+      return {
+        success: false,
+        operation_id: operationId,
+        status: "ERROR",
+        reason: `HTTP ${res.status}: ${res.statusText}`,
+      };
+    }
+    return (await res.json()) as ApproveAuthorizationResponse;
+  } catch (err: any) {
+    return {
+      success: false,
+      operation_id: operationId,
+      status: "ERROR",
+      reason: err.message || "Failed to connect to approval service.",
+    };
   }
 }
 

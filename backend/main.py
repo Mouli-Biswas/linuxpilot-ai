@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ✅ FIXED IMPORTS
 from backend.api.routes_agent import router as agent_router
+from backend.api.routes_auth import auth_router
 from backend.api.routes_diagnostics import router as diagnostics_router
 from backend.api.routes_intent import router as intent_router
 from backend.api.routes_search_exec import exec_router, search_router
@@ -69,6 +70,7 @@ app.include_router(logs_router)
 app.include_router(search_router)
 app.include_router(exec_router)
 app.include_router(agent_router)
+app.include_router(auth_router)
 
 
 from fastapi.responses import JSONResponse

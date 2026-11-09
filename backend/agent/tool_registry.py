@@ -4,14 +4,17 @@ tool_registry.py
 Maps the tool names used in a Plan (see agent/planner.py) to the actual
 backend callables. This is the single seam between "the LLM decided to
 call diagnostics.cpu" and "we actually import and run get_cpu_metrics()".
-Centralizing it here means adding a new tool is a one-line registration,
-not a change scattered across the orchestrator.
+
+Security Invariant:
+State-changing tools (service.restart, service.start, service.stop, command.execute)
+enforce centralized action-bound authorization. Calling them without a valid
+operation_id yields an authorization requirement with a structured preview.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from backend.commands.log_analysis import DmesgQuery, JournalctlQuery, query_dmesg, query_journalctl
 from backend.diagnostics.diagnostics import (
@@ -61,15 +64,21 @@ def _service_status(args: dict[str, Any]) -> dict:
 
 
 def _service_restart(args: dict[str, Any]) -> dict:
-    return restart_service(args.get("service_name", "")).model_dump()
+    service_name = args.get("service_name", "")
+    operation_id = args.get("operation_id")
+    return restart_service(service_name, operation_id=operation_id).model_dump()
 
 
 def _service_start(args: dict[str, Any]) -> dict:
-    return start_service(args.get("service_name", "")).model_dump()
+    service_name = args.get("service_name", "")
+    operation_id = args.get("operation_id")
+    return start_service(service_name, operation_id=operation_id).model_dump()
 
 
 def _service_stop(args: dict[str, Any]) -> dict:
-    return stop_service(args.get("service_name", "")).model_dump()
+    service_name = args.get("service_name", "")
+    operation_id = args.get("operation_id")
+    return stop_service(service_name, operation_id=operation_id).model_dump()
 
 
 def _logs_journalctl(args: dict[str, Any]) -> dict:
@@ -85,7 +94,9 @@ def _logs_dmesg(args: dict[str, Any]) -> dict:
 def _command_execute(args: dict[str, Any]) -> dict:
     cmd = args.get("command", "")
     confirmed = args.get("confirmed", False)
-    result = execute_validated_command(cmd, confirmed=confirmed)
+    operation_id = args.get("operation_id")
+    result = execute_validated_command(cmd, confirmed=confirmed, operation_id=operation_id)
+
     # Serialize ExecutionResult dataclass cleanly
     val_dict = {
         "verdict": result.validation.verdict.value,
@@ -94,6 +105,11 @@ def _command_execute(args: dict[str, Any]) -> dict:
         "reason": result.validation.reason,
         "requires_confirmation": result.validation.requires_confirmation,
         "matched_rule": result.validation.matched_rule,
+        "authorization_preview": (
+            result.validation.authorization_preview.model_dump()
+            if result.validation.authorization_preview
+            else None
+        ),
     }
     return {
         "command": result.command,
@@ -104,6 +120,10 @@ def _command_execute(args: dict[str, Any]) -> dict:
         "stdout": result.stdout,
         "stderr": result.stderr,
         "error": result.error,
+        "authorization": (
+            result.authorization.model_dump() if result.authorization else None
+        ),
+        "authorization_status": result.authorization_status,
     }
 
 
@@ -122,7 +142,6 @@ TOOL_REGISTRY: dict[str, ToolFn] = {
     "logs.dmesg": _logs_dmesg,
     "command.execute": _command_execute,
 }
-
 
 
 def run_tool(tool_name: str, args: dict[str, Any]) -> dict:

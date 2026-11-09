@@ -11,13 +11,17 @@ Safety Architecture:
    Can be executed automatically.
 2. MODIFYING (REQUIRES_CONFIRMATION):
    State-altering actions (systemctl restart, apt install, rm, mv, chmod, etc.)
-   Require explicit user confirmation before execution.
+   Require explicit action-bound cryptographic authorization before execution.
+   A generic boolean confirmation flag can NEVER independently authorize execution.
 3. DANGEROUS (BLOCKED):
    Catastrophic or destructive actions (rm -rf /, mkfs, dd to device, fork bombs,
    curl pipe bash, disk wipes, etc.)
    Strictly blocked with zero exceptions.
 
-Never use shell=True. Always pass a parsed argument list to subprocess.
+Execution Invariants:
+- Never use shell=True. Always pass a parsed argument list to subprocess.
+- Unsupported shell metacharacters (chaining, redirection, command substitution,
+  background execution) are rejected upfront to prevent validation-execution divergence.
 """
 
 from __future__ import annotations
@@ -26,10 +30,14 @@ import logging
 import re
 import shlex
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
+from backend.security.authorization import (
+    AuthorizationPreview,
+    auth_manager,
+)
 from backend.utils.config import settings
 
 logger = logging.getLogger("linuxpilot.validator")
@@ -55,6 +63,7 @@ class ValidationResult:
     reason: str
     requires_confirmation: bool = False
     matched_rule: Optional[str] = None
+    authorization_preview: Optional[AuthorizationPreview] = None
 
 
 @dataclass
@@ -67,6 +76,8 @@ class ExecutionResult:
     stdout: str = ""
     stderr: str = ""
     error: Optional[str] = None
+    authorization: Optional[AuthorizationPreview] = None
+    authorization_status: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +182,13 @@ _MODIFYING_BASE_COMMANDS: set[str] = {
 
 _ALL_ALLOWED_BASE_COMMANDS: set[str] = _READ_ONLY_BASE_COMMANDS | _MODIFYING_BASE_COMMANDS
 
+# Unsupported shell metacharacters and constructs for single-command execution.
+# LinuxPilot AI executes strictly via argument list (shell=False). Chaining, redirection,
+# command substitution, and background execution are strictly rejected.
+_UNSUPPORTED_SHELL_SYNTAX_PATTERN: re.Pattern = re.compile(
+    r"(&&|\|\||[;&|><]|\$\(|\`|[\r\n])"
+)
+
 
 def _normalize(command: str) -> str:
     return re.sub(r"\s+", " ", command.strip().lower())
@@ -180,7 +198,7 @@ def validate_command(command: str) -> ValidationResult:
     """
     Validates a shell command against the 3-tier safety architecture:
     - READ_ONLY (ALLOWED) -> Can run automatically
-    - MODIFYING (REQUIRES_CONFIRMATION) -> Needs explicit user confirmation
+    - MODIFYING (REQUIRES_CONFIRMATION) -> Needs explicit action-bound authorization
     - DANGEROUS (BLOCKED) -> Strictly blocked
     """
     stripped = command.strip()
@@ -193,7 +211,33 @@ def validate_command(command: str) -> ValidationResult:
             requires_confirmation=False,
         )
 
-    # shlex.split raises on unbalanced quotes -- treat as suspicious/invalid
+    # 1) Blocklist check — catastrophic patterns, checked first and always.
+    normalized = _normalize(stripped)
+    for rule in _BLOCK_RULES:
+        if rule.pattern.search(normalized):
+            logger.warning("Command blocked by rule '%s': %s", rule.name, command)
+            return ValidationResult(
+                verdict=ValidationVerdict.BLOCKED,
+                category=SafetyCategory.DANGEROUS,
+                command=command,
+                reason=rule.explanation,
+                requires_confirmation=False,
+                matched_rule=rule.name,
+            )
+
+    # 2) Strict rejection of unsupported shell metacharacters and chaining.
+    # Validation and execution MUST interpret the exact same operation.
+    if _UNSUPPORTED_SHELL_SYNTAX_PATTERN.search(stripped):
+        logger.warning("Command rejected due to unsupported shell syntax: %s", command)
+        return ValidationResult(
+            verdict=ValidationVerdict.BLOCKED,
+            category=SafetyCategory.DANGEROUS,
+            command=command,
+            reason="Unsupported shell syntax detected. LinuxPilot AI executes commands strictly as parsed argument lists (shell=False) and rejects shell chaining (&&, ||, ;, |), redirection (>, <), command substitution ($(), `), and background execution (&).",
+            requires_confirmation=False,
+        )
+
+    # 3) Parse command into tokens using shlex
     try:
         tokens = shlex.split(stripped)
     except ValueError as exc:
@@ -214,124 +258,305 @@ def validate_command(command: str) -> ValidationResult:
             requires_confirmation=False,
         )
 
-    normalized = _normalize(stripped)
-
-    # 1) Blocklist check — catastrophic patterns, checked first and always.
-    for rule in _BLOCK_RULES:
-        if rule.pattern.search(normalized):
-            logger.warning("Command blocked by rule '%s': %s", rule.name, command)
-            return ValidationResult(
-                verdict=ValidationVerdict.BLOCKED,
-                category=SafetyCategory.DANGEROUS,
-                command=command,
-                reason=rule.explanation,
-                requires_confirmation=False,
-                matched_rule=rule.name,
-            )
-
-    # 2) Chained-command check: split on ; && || | and validate every segment.
-    segments = re.split(r"&&|\|\||;|\|", stripped)
-    if len(segments) > 1:
-        has_modifying = False
-        for segment in segments:
-            seg = segment.strip()
-            if not seg:
-                continue
-            sub_result = validate_command(seg)
-            if sub_result.verdict is ValidationVerdict.BLOCKED:
-                return ValidationResult(
-                    verdict=ValidationVerdict.BLOCKED,
-                    category=SafetyCategory.DANGEROUS,
-                    command=command,
-                    reason=f"Blocked because chained segment '{seg}' is unsafe: {sub_result.reason}",
-                    requires_confirmation=False,
-                    matched_rule=sub_result.matched_rule,
-                )
-            if sub_result.category is SafetyCategory.MODIFYING:
-                has_modifying = True
-
-        if has_modifying:
-            return ValidationResult(
-                verdict=ValidationVerdict.REQUIRES_CONFIRMATION,
-                category=SafetyCategory.MODIFYING,
-                command=command,
-                reason="Chained command contains modifying operations and requires user confirmation.",
-                requires_confirmation=True,
-            )
-        return ValidationResult(
-            verdict=ValidationVerdict.ALLOWED,
-            category=SafetyCategory.READ_ONLY,
-            command=command,
-            reason="All chained segments passed read-only validation.",
-            requires_confirmation=False,
-        )
-
-    # 3) Base-command check
-    base_command = tokens[0].split("/")[-1].lower()  # strip path prefix e.g. /usr/bin/
-    
-    # Strip sudo prefix if present to inspect underlying command
-    if base_command == "sudo" and len(tokens) > 1:
-        base_command = tokens[1].split("/")[-1].lower()
-        sub_cmd_index = 1
-    else:
-        sub_cmd_index = 0
-
-    if base_command not in _ALL_ALLOWED_BASE_COMMANDS:
+    # 4) Sudo check - Reject sudo by default, including when underlying command is read-only
+    raw_base = tokens[0].split("/")[-1].lower()
+    if raw_base == "sudo":
         return ValidationResult(
             verdict=ValidationVerdict.BLOCKED,
             category=SafetyCategory.DANGEROUS,
             command=command,
-            reason=f"'{base_command}' is not in the approved command allow-list for automated execution.",
+            reason="sudo is rejected by default. Automated execution with elevated privileges is not permitted.",
             requires_confirmation=False,
         )
 
-    # Special handling for systemctl / service commands:
-    # 'systemctl status <unit>', 'systemctl is-active <unit>' are READ_ONLY
-    # 'systemctl restart/start/stop' are MODIFYING
-    if base_command in {"systemctl", "service"}:
-        remaining_tokens = [t.lower() for t in tokens[sub_cmd_index + 1:]]
-        if any(action in remaining_tokens for action in ["status", "is-active", "is-enabled", "is-failed"]):
-            return ValidationResult(
-                verdict=ValidationVerdict.ALLOWED,
-                category=SafetyCategory.READ_ONLY,
-                command=command,
-                reason="Read-only service status check approved.",
-                requires_confirmation=False,
-            )
-        return ValidationResult(
-            verdict=ValidationVerdict.REQUIRES_CONFIRMATION,
-            category=SafetyCategory.MODIFYING,
-            command=command,
-            reason="Service modification requires explicit user confirmation.",
-            requires_confirmation=True,
-        )
-
-    # 4) Categorize as READ_ONLY or MODIFYING
-    if base_command in _READ_ONLY_BASE_COMMANDS:
-        return ValidationResult(
-            verdict=ValidationVerdict.ALLOWED,
-            category=SafetyCategory.READ_ONLY,
-            command=command,
-            reason="Read-only inspection command approved for automatic execution.",
-            requires_confirmation=False,
-        )
-
-    # Modifying commands require confirmation
+    verdict, category, reason = _categorize_command_and_arguments(tokens, stripped)
+    requires_conf = (verdict == ValidationVerdict.REQUIRES_CONFIRMATION)
     return ValidationResult(
-        verdict=ValidationVerdict.REQUIRES_CONFIRMATION,
-        category=SafetyCategory.MODIFYING,
+        verdict=verdict,
+        category=category,
         command=command,
-        reason=f"Command '{base_command}' modifies system state and requires explicit confirmation.",
-        requires_confirmation=True,
+        reason=reason,
+        requires_confirmation=requires_conf,
     )
 
 
-def execute_validated_command(command: str, confirmed: bool = False) -> ExecutionResult:
+def _categorize_command_and_arguments(
+    tokens: list[str], raw_command: str
+) -> tuple[ValidationVerdict, SafetyCategory, str]:
+    """
+    Granular default-deny argument policy per executable.
+    Rejects dangerous subcommands, flags, and indirect execution.
+    """
+    base_command = tokens[0].split("/")[-1].lower()
+
+    if base_command not in _ALL_ALLOWED_BASE_COMMANDS:
+        return (
+            ValidationVerdict.BLOCKED,
+            SafetyCategory.DANGEROUS,
+            f"'{base_command}' is not in the approved command allow-list for automated execution.",
+        )
+
+    all_args = [t.lower() for t in tokens[1:]]
+
+    # --- SYSTEMCTL ---
+    if base_command == "systemctl":
+        non_options = [t.lower() for t in tokens[1:] if not t.startswith("-")]
+        modifying_verbs = {
+            "restart", "start", "stop", "reload", "enable", "disable", "mask", "unmask",
+            "edit", "daemon-reload", "kill", "reboot", "poweroff", "halt", "set-property",
+        }
+        dangerous_verbs = {"reboot", "poweroff", "halt"}
+        if any(t in dangerous_verbs for t in all_args):
+            return (
+                ValidationVerdict.BLOCKED,
+                SafetyCategory.DANGEROUS,
+                "systemctl poweroff/reboot/halt is blocked from automated execution.",
+            )
+        if not non_options:
+            return (
+                ValidationVerdict.ALLOWED,
+                SafetyCategory.READ_ONLY,
+                "Read-only systemctl unit listing approved.",
+            )
+        primary_subcmd = non_options[0]
+        has_modifying_token = any(token in modifying_verbs for token in all_args)
+        if primary_subcmd in {"status", "is-active", "is-enabled", "is-failed"}:
+            if has_modifying_token:
+                # Misleading arguments: e.g. 'systemctl restart nginx status'
+                return (
+                    ValidationVerdict.REQUIRES_CONFIRMATION,
+                    SafetyCategory.MODIFYING,
+                    "Service modification requires explicit action-bound confirmation.",
+                )
+            return (
+                ValidationVerdict.ALLOWED,
+                SafetyCategory.READ_ONLY,
+                "Read-only service status check approved.",
+            )
+        elif primary_subcmd in {"restart", "start", "stop", "reload"}:
+            return (
+                ValidationVerdict.REQUIRES_CONFIRMATION,
+                SafetyCategory.MODIFYING,
+                f"systemctl {primary_subcmd} modifies service state and requires explicit action-bound confirmation.",
+            )
+        else:
+            return (
+                ValidationVerdict.BLOCKED,
+                SafetyCategory.DANGEROUS,
+                f"Unsupported or unconstrained systemctl subcommand '{primary_subcmd}'.",
+            )
+
+    # --- SERVICE ---
+    if base_command == "service":
+        modifying_verbs = {"restart", "start", "stop", "reload"}
+        if any(t in modifying_verbs for t in all_args):
+            return (
+                ValidationVerdict.REQUIRES_CONFIRMATION,
+                SafetyCategory.MODIFYING,
+                "Service modification requires explicit action-bound confirmation.",
+            )
+        if "status" in all_args or "--status-all" in all_args:
+            return (
+                ValidationVerdict.ALLOWED,
+                SafetyCategory.READ_ONLY,
+                "Read-only service status check approved.",
+            )
+        return (
+            ValidationVerdict.BLOCKED,
+            SafetyCategory.DANGEROUS,
+            "Unsupported service action form.",
+        )
+
+    # --- ENV / PRINTENV ---
+    if base_command == "printenv":
+        return (
+            ValidationVerdict.ALLOWED,
+            SafetyCategory.READ_ONLY,
+            "Read-only environment variable inspection approved.",
+        )
+
+    if base_command == "env":
+        # Check for indirect program execution (e.g. env bash, env python, etc.)
+        args = tokens[1:]
+        idx = 0
+        while idx < len(args):
+            arg = args[idx]
+            if arg in {"-i", "-0", "--null", "--ignore-environment"}:
+                idx += 1
+            elif arg in {"-u", "--unset"} and idx + 1 < len(args):
+                idx += 2
+            elif arg.startswith("-u=") or arg.startswith("--unset="):
+                idx += 1
+            elif "=" in arg and not arg.startswith("-"):
+                idx += 1
+            else:
+                return (
+                    ValidationVerdict.BLOCKED,
+                    SafetyCategory.DANGEROUS,
+                    f"Indirect command execution via 'env {arg}' is strictly blocked.",
+                )
+        return (
+            ValidationVerdict.ALLOWED,
+            SafetyCategory.READ_ONLY,
+            "Read-only environment inspection approved.",
+        )
+
+    # --- FIND ---
+    if base_command == "find":
+        dangerous_flags = {
+            "-exec", "-execdir", "-ok", "-okdir", "-delete",
+            "-fprint", "-fprint0", "-fprintf", "-fls",
+        }
+        for t in all_args:
+            if t in dangerous_flags or t.startswith("-exec") or t.startswith("-ok"):
+                return (
+                    ValidationVerdict.BLOCKED,
+                    SafetyCategory.DANGEROUS,
+                    f"find option '{t}' allows command execution or deletion and is strictly blocked.",
+                )
+        return (
+            ValidationVerdict.ALLOWED,
+            SafetyCategory.READ_ONLY,
+            "Read-only find file search approved.",
+        )
+
+    # --- IP ---
+    if base_command == "ip":
+        modifying_ip = {"add", "del", "delete", "set", "change", "replace", "flush", "save", "restore"}
+        if any(t in modifying_ip for t in all_args):
+            return (
+                ValidationVerdict.REQUIRES_CONFIRMATION,
+                SafetyCategory.MODIFYING,
+                "Network configuration modification via 'ip' requires explicit authorization.",
+            )
+        return (
+            ValidationVerdict.ALLOWED,
+            SafetyCategory.READ_ONLY,
+            "Read-only ip inspection approved.",
+        )
+
+    # --- GIT ---
+    if base_command == "git":
+        for t in all_args:
+            if t == "--exec-path" or t.startswith("--exec-path="):
+                return (
+                    ValidationVerdict.BLOCKED,
+                    SafetyCategory.DANGEROUS,
+                    "git --exec-path is strictly blocked.",
+                )
+            if t == "-c":
+                return (
+                    ValidationVerdict.BLOCKED,
+                    SafetyCategory.DANGEROUS,
+                    "git -c configuration override is strictly blocked.",
+                )
+            if t == "config":
+                return (
+                    ValidationVerdict.BLOCKED,
+                    SafetyCategory.DANGEROUS,
+                    "git config command is blocked from automated execution.",
+                )
+            if t == "clean" and any(flag in all_args for flag in ["-f", "-force"]):
+                return (
+                    ValidationVerdict.BLOCKED,
+                    SafetyCategory.DANGEROUS,
+                    "git clean -f is blocked from automated execution.",
+                )
+
+        subcmds = [t for t in all_args if not t.startswith("-")]
+        if not subcmds:
+            return (
+                ValidationVerdict.ALLOWED,
+                SafetyCategory.READ_ONLY,
+                "Read-only git status approved.",
+            )
+        git_sub = subcmds[0]
+        if git_sub in {"status", "log", "diff", "branch", "show", "tag", "remote"}:
+            if any(m in all_args for m in ["-d", "-D", "add", "rm", "remove", "rename", "set-url"]):
+                return (
+                    ValidationVerdict.REQUIRES_CONFIRMATION,
+                    SafetyCategory.MODIFYING,
+                    f"git {git_sub} with modifying flags requires confirmation.",
+                )
+            return (
+                ValidationVerdict.ALLOWED,
+                SafetyCategory.READ_ONLY,
+                f"Read-only git {git_sub} approved.",
+            )
+        elif git_sub in {"commit", "add", "checkout", "switch", "stash", "fetch", "pull"}:
+            return (
+                ValidationVerdict.REQUIRES_CONFIRMATION,
+                SafetyCategory.MODIFYING,
+                f"git {git_sub} modifies repository state and requires confirmation.",
+            )
+        else:
+            return (
+                ValidationVerdict.BLOCKED,
+                SafetyCategory.DANGEROUS,
+                f"git {git_sub} is not permitted for automated execution.",
+            )
+
+    # --- PACKAGE MANAGERS ---
+    if base_command in {"apt", "apt-get", "dnf", "yum", "pacman", "snap", "pip", "pip3", "npm"}:
+        subcmds = [t.lower() for t in tokens[1:] if not t.startswith("-")]
+        read_only_pkg_subcmds = {"list", "search", "show", "view", "info", "check", "outdated"}
+        if subcmds and subcmds[0] in read_only_pkg_subcmds:
+            return (
+                ValidationVerdict.ALLOWED,
+                SafetyCategory.READ_ONLY,
+                f"Read-only {base_command} {subcmds[0]} approved.",
+            )
+        return (
+            ValidationVerdict.REQUIRES_CONFIRMATION,
+            SafetyCategory.MODIFYING,
+            f"Package management command '{base_command}' modifies system state and requires confirmation.",
+        )
+
+    # --- PROCESS CONTROL ---
+    if base_command in {"kill", "pkill"}:
+        return (
+            ValidationVerdict.REQUIRES_CONFIRMATION,
+            SafetyCategory.MODIFYING,
+            f"Process control command '{base_command}' modifies state and requires confirmation.",
+        )
+
+    # --- FILESYSTEM MODIFYING ---
+    if base_command in {"rm", "mv", "cp", "mkdir", "rmdir", "touch", "chmod", "chown"}:
+        return (
+            ValidationVerdict.REQUIRES_CONFIRMATION,
+            SafetyCategory.MODIFYING,
+            f"Filesystem command '{base_command}' modifies state and requires confirmation.",
+        )
+
+    # --- SAFE INSPECTION COMMANDS ---
+    if base_command in _READ_ONLY_BASE_COMMANDS:
+        return (
+            ValidationVerdict.ALLOWED,
+            SafetyCategory.READ_ONLY,
+            f"Read-only inspection command '{base_command}' approved for automatic execution.",
+        )
+
+    return (
+        ValidationVerdict.REQUIRES_CONFIRMATION,
+        SafetyCategory.MODIFYING,
+        f"Command '{base_command}' modifies system state and requires confirmation.",
+    )
+
+
+def execute_validated_command(
+    command: str,
+    confirmed: bool = False,
+    operation_id: Optional[str] = None,
+) -> ExecutionResult:
     """
     Validates, then runs the command with subprocess (shell=False).
     - If BLOCKED -> does not execute, returns error reason.
-    - If REQUIRES_CONFIRMATION and not confirmed -> returns confirmation requirement.
-    - If ALLOWED (READ_ONLY) or confirmed -> executes safely.
+    - If MODIFYING and not authorized via valid operation_id -> returns confirmation requirement
+      with an action-bound authorization ticket preview.
+    - If ALLOWED (READ_ONLY) or authorized with valid operation_id -> executes safely.
+
+    A generic boolean confirmed=True without a valid operation_id CANNOT authorize
+    a modifying command.
     """
     validation = validate_command(command)
 
@@ -342,26 +567,84 @@ def execute_validated_command(command: str, confirmed: bool = False) -> Executio
             executed=False,
             requires_confirmation=False,
             error=f"Command blocked by safety layer: {validation.reason}",
+            authorization_status="BLOCKED",
         )
 
-    if validation.category is SafetyCategory.MODIFYING and not confirmed:
-        return ExecutionResult(
-            command=command,
-            validation=validation,
-            executed=False,
-            requires_confirmation=True,
-            error="Command requires explicit user confirmation before execution.",
+    # If modifying command, enforce action-bound authorization
+    if validation.category is SafetyCategory.MODIFYING:
+        target_resource = f"command:{command.strip()}"
+        parameters = {"command": command.strip()}
+        expected_postconditions = {"return_code": 0}
+
+        # If no operation_id is provided, create a pending authorization ticket and preview
+        if not operation_id:
+            auth = auth_manager.create_authorization(
+                action="command.execute",
+                target_resource=target_resource,
+                parameters=parameters,
+                expected_postconditions=expected_postconditions,
+                action_summary=f"Execute modifying command: `{command.strip()}`",
+            )
+            preview = auth_manager.to_preview(auth)
+            validation.authorization_preview = preview
+            return ExecutionResult(
+                command=command,
+                validation=validation,
+                executed=False,
+                requires_confirmation=True,
+                error="Command requires explicit user approval before execution.",
+                authorization=preview,
+                authorization_status="PENDING",
+            )
+
+        # 1. Non-destructively check authorization status (must be APPROVED)
+        decision = auth_manager.check_authorization(
+            operation_id=operation_id,
+            action="command.execute",
+            target_resource=target_resource,
+            parameters=parameters,
+            expected_postconditions=expected_postconditions,
         )
 
-    # For modifying commands that are confirmed, check master execution switch
-    if validation.category is SafetyCategory.MODIFYING and not settings.ALLOW_COMMAND_EXECUTION:
-        return ExecutionResult(
-            command=command,
-            validation=validation,
-            executed=False,
-            requires_confirmation=False,
-            error="Execution disabled: ALLOW_COMMAND_EXECUTION=false in environment configuration (dry-run mode).",
+        if not decision.is_authorized:
+            return ExecutionResult(
+                command=command,
+                validation=validation,
+                executed=False,
+                requires_confirmation=False,
+                error=f"Authorization rejected: {decision.reason}",
+                authorization_status="REJECTED",
+            )
+
+        # 2. Master execution switch check BEFORE consuming ticket
+        if not settings.ALLOW_COMMAND_EXECUTION:
+            return ExecutionResult(
+                command=command,
+                validation=validation,
+                executed=False,
+                requires_confirmation=False,
+                error="Execution disabled: ALLOW_COMMAND_EXECUTION=false in environment configuration (dry-run mode).",
+                authorization_status="AUTHORIZED_BUT_DISABLED",
+            )
+
+        # 3. Atomically consume the authorization ticket
+        consume_decision = auth_manager.validate_and_consume(
+            operation_id=operation_id,
+            action="command.execute",
+            target_resource=target_resource,
+            parameters=parameters,
+            expected_postconditions=expected_postconditions,
         )
+
+        if not consume_decision.is_authorized:
+            return ExecutionResult(
+                command=command,
+                validation=validation,
+                executed=False,
+                requires_confirmation=False,
+                error=f"Authorization consumption failed: {consume_decision.reason}",
+                authorization_status="REJECTED",
+            )
 
     try:
         tokens = shlex.split(command)
@@ -381,6 +664,7 @@ def execute_validated_command(command: str, confirmed: bool = False) -> Executio
             return_code=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
+            authorization_status="CONSUMED" if validation.category is SafetyCategory.MODIFYING else None,
         )
     except subprocess.TimeoutExpired:
         return ExecutionResult(
@@ -389,6 +673,7 @@ def execute_validated_command(command: str, confirmed: bool = False) -> Executio
             executed=False,
             requires_confirmation=False,
             error=f"Command timed out after {settings.COMMAND_TIMEOUT_SECONDS}s.",
+            authorization_status="FAILED",
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.exception("Execution failed for validated command")
@@ -398,4 +683,5 @@ def execute_validated_command(command: str, confirmed: bool = False) -> Executio
             executed=False,
             requires_confirmation=False,
             error=str(exc),
+            authorization_status="FAILED",
         )
